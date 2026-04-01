@@ -1,1 +1,906 @@
 
+# Rapport Technique Complet — Plateforme Décentralisée de Bug Bounty
+
+**Projet** : BugBountyDeFi — Plateforme de Bug Bounty Décentralisée  
+**Stack** : Solidity 0.8.20 · Foundry · Next.js 14 · Wagmi · Viem · TailwindCSS  
+**Réseau** : Arbitrum Sepolia (Testnet)  
+**Date** : Avril 2026
+
+---
+
+## Table des matières
+
+1. [Introduction](#1-introduction)
+2. [Architecture du système](#2-architecture-du-système)
+3. [Description des Smart Contracts](#3-description-des-smart-contracts)
+4. [Interface Utilisateur — Dashboards par Rôle](#4-interface-utilisateur--dashboards-par-rôle)
+5. [Structure des Composants React/Web3](#5-structure-des-composants-reactweb3)
+6. [UX Flows — Parcours Utilisateur](#6-ux-flows--parcours-utilisateur)
+7. [Tests et Validation](#7-tests-et-validation)
+8. [Analyse de Sécurité](#8-analyse-de-sécurité)
+9. [Améliorations Proposées](#9-améliorations-proposées)
+10. [Conclusion](#10-conclusion)
+
+---
+
+## 1. Introduction
+
+### 1.1 Contexte
+
+Les plateformes de bug bounty centralisées (HackerOne, Bugcrowd, Immunefi) présentent des limitations structurelles : dépendance envers un tiers de confiance pour le paiement, absence de transparence dans l'évaluation, et risques de censure ou de non-paiement. BugBountyDeFi propose une alternative **entièrement décentralisée** où :
+
+- Les fonds sont verrouillés dans un **escrow on-chain** avant toute soumission
+- L'évaluation est assurée par un **comité K-of-N** indépendant
+- Les disputes sont résolues via un protocole **commit-reveal** anti-groupthink
+- Un système de **réputation temporelle** modère dynamiquement l'accès
+
+### 1.2 Objectifs du projet
+
+| Objectif | Description |
+|----------|-------------|
+| **Trustlessness** | Aucune confiance requise envers un tiers centralisé |
+| **Confidentialité** | Rapports chiffrés en AES-256-GCM côté client |
+| **Équité** | Voting secret via commit-reveal en 2 phases |
+| **Anti-spam** | Staking dynamique + rate limiting O(1) |
+| **Automatisation** | SLA automatisés avec escalade programmatique |
+| **Séparation des rôles** | Dashboards isolés par persona |
+
+### 1.3 Pile technologique
+
+| Couche | Technologie | Rôle |
+|--------|-------------|------|
+| Smart Contracts | Solidity 0.8.20 | Logique métier on-chain |
+| Framework Blockchain | Foundry (forge, anvil) | Compilation, tests, déploiement |
+| Bibliothèques Solidity | OpenZeppelin 5.x | ReentrancyGuard, SafeERC20, ERC20 |
+| Frontend | Next.js 14 (App Router) | Interface utilisateur SPA |
+| Web3 | Wagmi v2 + Viem | Interaction blockchain |
+| Styling | TailwindCSS 3.x | Design system |
+| Chiffrement | WebCrypto API (AES-256-GCM) | Chiffrement client-side |
+| Stockage off-chain | IPFS via Pinata | Stockage des rapports chiffrés |
+| Token de test | MockUSDC (6 décimales) | Simulation de paiements |
+
+---
+
+## 2. Architecture du système
+
+### 2.1 Vue d'ensemble
+
+```mermaid
+graph TB
+    subgraph "Frontend (Next.js)"
+        R[Researcher] -->|"chiffre AES-256-GCM"| ENC[Encryption Service]
+        R -->|"soumet hashes"| TX[Transaction Wagmi]
+        O[Owner] -->|"crée bounty + fund"| TX
+        C[Committee] -->|"vote / commit-reveal"| TX
+        A[Admin] -->|"lecture seule"| READ[Read Contracts]
+    end
+
+    subgraph "Off-Chain"
+        ENC -->|"upload payload chiffré"| IPFS[(IPFS / Pinata)]
+    end
+
+    subgraph "Blockchain (EVM)"
+        TX --> BBP["BugBountyPlatform.sol\n(Hub Principal)"]
+        BBP --> ESC[Escrow.sol]
+        BBP --> SM[StakeManager.sol]
+        BBP --> REP[Reputation.sol]
+        BBP --> DM[DisputeModule.sol]
+        READ --> BBP
+    end
+
+    subgraph "Tokens ERC20"
+        USDC[MockUSDC] -.->|"transferts"| ESC
+        USDC -.->|"transferts"| SM
+    end
+
+    style BBP fill:#1e3a5f,color:#fff
+    style ESC fill:#2d6a4f,color:#fff
+    style SM fill:#6b3d14,color:#fff
+    style REP fill:#4a235a,color:#fff
+    style DM fill:#7b1d1d,color:#fff
+```
+
+### 2.2 Architecture modulaire des contrats
+
+Le système suit le pattern **Hub & Modules** : un contrat central (`BugBountyPlatform.sol`) déploie et orchestre quatre modules spécialisés.
+
+```mermaid
+graph LR
+    subgraph "Déployé par le Hub"
+        direction TB
+        E[Escrow] --- S[StakeManager]
+        S --- R[Reputation]
+        R --- D[DisputeModule]
+    end
+    
+    H["BugBountyPlatform\n(Hub)"] -->|deploys| E
+    H -->|deploys| S
+    H -->|deploys| R
+    H -->|deploys| D
+    
+    H -.->|implements| I[IBugBounty]
+```
+
+### 2.3 Séparation des responsabilités (SOC)
+
+| Module | Responsabilité | Isolation |
+|--------|---------------|-----------|
+| `BugBountyPlatform` | Orchestration, API publique, règles métier | Point d'entrée unique |
+| `Escrow` | Custody des fonds (récompenses + bonds) | `onlyPlatform` modifier |
+| `StakeManager` | Gestion des stakes chercheurs (lock/refund/slash) | `onlyPlatform` modifier |
+| `Reputation` | Scoring temporel avec half-life exponentielle | `onlyPlatform` modifier |
+| `DisputeModule` | Protocole commit-reveal 2 phases | `onlyPlatform` modifier |
+| `IBugBounty` | Types, événements, erreurs partagées | Interface pure |
+| `MockUSDC` | Token de test ERC20 (6 décimales) | Indépendant |
+
+---
+
+## 3. Description des Smart Contracts
+
+### 3.1 `IBugBounty.sol` — Interface canonique
+
+#### Machine d'états des rapports
+
+```mermaid
+stateDiagram-v2
+    [*] --> Submitted : submitReport()
+    Submitted --> Accepted : voteReport(true) × K
+    Submitted --> Rejected : voteReport(false) × K
+    Submitted --> Disputed : triggerEscalation()
+    Rejected --> Disputed : raiseDispute()
+    Disputed --> Accepted : resolveDispute() [accept ≥ K]
+    Disputed --> Rejected : resolveDispute() [reject ≥ K]
+    Accepted --> Finalized : finalizeReport()
+    Rejected --> Finalized : finalizeReport()
+```
+
+#### Structure `Bounty` — Paramètres de configuration
+
+| Paramètre | Type | Description | Exemple |
+|-----------|------|-------------|---------|
+| `owner` | `address` | Créateur de la bounty | `0x1234...` |
+| `token` | `IERC20` | Token ERC20 pour paiements | USDC |
+| `rewardAmount` | `uint256` | Récompense pour rapport accepté | 5 000 USDC |
+| `stakeAmount` | `uint256` | Stake de base requis | 50 USDC |
+| `appealBond` | `uint256` | Caution pour ouvrir un dispute | 100 USDC |
+| `submissionDeadline` | `uint64` | Date limite de soumission | +7 jours |
+| `reviewSLA` | `uint32` | Délai max pour vote du comité | 3 jours |
+| `rateLimitWindow` | `uint32` | Fenêtre anti-spam | 48 heures |
+| `stakeEscalationBps` | `uint16` | Multiplicateur stake/réputation | 1000 bps |
+| `maxInWindow` | `uint8` | Max soumissions par fenêtre | 2 |
+| `maxActiveSubmissions` | `uint8` | Max rapports actifs simultanés | 1 |
+| `committeeSize` | `uint8` | Taille du comité | 3 |
+| `thresholdK` | `uint8` | Seuil de consensus | 2 (K-of-N) |
+| `disputeCommitSeconds` | `uint32` | Durée phase Commit | 3 jours |
+| `disputeRevealSeconds` | `uint32` | Durée phase Reveal | 6 jours |
+
+#### Structure `Report` — Données d'un rapport
+
+| Champ | Type | Rôle |
+|-------|------|------|
+| `researcher` | `address` | Auteur du rapport |
+| `submittedAt` | `uint64` | Timestamp de soumission |
+| `paid` | `bool` | Protection anti-double paiement |
+| `status` | `ReportStatus` | État dans la machine d'états |
+| `acceptVotes` / `rejectVotes` | `uint8` | Compteurs de votes |
+| `commitHash` | `bytes32` | Hash domain-séparé (anti-frontrunning) |
+| `cidDigest` | `bytes32` | Hash du CID IPFS |
+| `hSteps` / `hImpact` / `hPoc` | `bytes32` | Hashes des sections du rapport |
+| `stakeAmount` | `uint256` | Stake effectivement verrouillé |
+
+> [!NOTE]
+> Les structures sont optimisées pour le **storage packing EVM** : les champs de petite taille sont regroupés dans un même slot de 256 bits pour réduire les coûts en gas.
+
+---
+
+### 3.2 `BugBountyPlatform.sol` — Hub principal (393 lignes)
+
+#### Rôle
+Point d'entrée unique du protocole. Implémente `IBugBounty` et hérite de `ReentrancyGuard` (OpenZeppelin).
+
+#### Fonctions principales
+
+| Fonction | Accès | Protection | Description |
+|----------|-------|------------|-------------|
+| `createBounty(...)` | Public | Validations | Crée une bounty avec tous ses paramètres |
+| `fundBounty(id, amount)` | `onlyBountyOwner` | — | Transfère des tokens vers l'Escrow |
+| `getRequiredStake(id, user)` | Public (view) | — | Calcule le stake dynamique basé sur la réputation |
+| `submitReport(...)` | Public | `nonReentrant` | Soumet un rapport avec stake et hashes |
+| `voteReport(id, rid, bool)` | `onlyCommittee` | `nonReentrant` | Vote Phase 1 (accept/reject) |
+| `raiseDispute(id, rid)` | Researcher uniquement | `nonReentrant` | Ouvre un dispute (+ appeal bond) |
+| `triggerEscalation(id, rid)` | Public | `nonReentrant` | Escalade automatique SLA |
+| `commitVote(id, rid, hash)` | `onlyCommittee` | `nonReentrant` | Phase Commit (dispute) |
+| `revealVote(id, rid, vote, salt)` | `onlyCommittee` | `nonReentrant` | Phase Reveal (dispute) |
+| `resolveDispute(id, rid)` | Public | `nonReentrant` | Résout le dispute + paiements |
+| `finalizeReport(id, rid)` | Public | `nonReentrant` | Finalise un rapport (hors dispute) |
+
+#### Mécanisme anti-spam : Ring Buffer O(1)
+
+```solidity
+uint64[] storage subs = userSubmissions[msg.sender][bountyId];
+if (subs.length < b.maxInWindow) {
+    subs.push(uint64(block.timestamp));
+} else {
+    uint256 idx = userSubmissionIdx[msg.sender][bountyId] % b.maxInWindow;
+    if (subs[idx] + b.rateLimitWindow > block.timestamp) revert RateLimitExceeded();
+    subs[idx] = uint64(block.timestamp);
+    userSubmissionIdx[msg.sender][bountyId] = (idx + 1) % b.maxInWindow;
+}
+```
+
+Ce mécanisme utilise un **buffer circulaire** (ring buffer) de taille fixe pour vérifier le rate limiting en O(1) au lieu de parcourir un tableau dynamique, éliminant le risque de **gas griefing**.
+
+#### Calcul du stake dynamique
+
+```solidity
+int64 score = reputation.repScore(user);
+int256 mult = 10000 - (score * stakeEscalationBps);
+mult = clamp(mult, 5000, 50000);  // 0.5× à 5×
+return (stakeAmount * uint256(mult)) / 10000;
+```
+
+| Réputation | Multiplicateur | Stake effectif |
+|------------|---------------|----------------|
+| +10 | 0.5× (plancher) | 25 USDC |
+| +5 | 0.5× | 25 USDC |
+| 0 | 1.0× | 50 USDC |
+| -5 | 1.5× | 75 USDC |
+| -10 | 2.0× | 100 USDC |
+| -50 | 5.0× (plafond) | 250 USDC |
+
+---
+
+### 3.3 `Escrow.sol` — Coffre-fort de fonds (37 lignes)
+
+| Fonction | Description |
+|----------|-------------|
+| `deposit(bountyId, amount)` | Enregistre un dépôt (comptabilité interne) |
+| `release(bountyId, token, to, amount)` | Libère des fonds après vérification du solde |
+
+> [!IMPORTANT]
+> `deposit()` ne transfère pas de tokens. Les tokens sont envoyés directement via `safeTransferFrom` vers `address(escrow)` par le hub. Cela évite une double approbation ERC20.
+
+---
+
+### 3.4 `StakeManager.sol` — Gestionnaire de stakes (50 lignes)
+
+```mermaid
+flowchart LR
+    R[Researcher] -->|"lockStake()"| SM[StakeManager]
+    SM -->|"refundStake()\n[rapport accepté]"| R
+    SM -->|"slashStake()\n[rapport rejeté]"| T[Treasury]
+```
+
+---
+
+### 3.5 `Reputation.sol` — Système de réputation temporelle (80 lignes)
+
+#### Deltas de score
+
+| Événement | Delta |
+|-----------|-------|
+| Rapport accepté | **+3** |
+| Rapport rejeté | **-2** |
+| Dispute gagné | **+2** |
+| Dispute perdu | **-3** |
+| Non-révélation de vote | **-2** |
+
+#### Décroissance exponential (Half-Life)
+
+```solidity
+uint256 halfLives = dt / 90 days;
+currentScore = currentScore / int64(1 << halfLives);
+```
+
+La half-life est de **90 jours**. Le score est divisé par 2 à chaque période. Après 64 half-lives (~16 ans), le score est remis à 0. Le calcul est **paresseux** (lazy) : il s'effectue uniquement lors de la lecture.
+
+> [!TIP]
+> Ce mécanisme permet la **réhabilitation** : un utilisateur avec un mauvais historique verra son score converger vers 0 au fil du temps, réduisant progressivement son stake requis.
+
+---
+
+### 3.6 `DisputeModule.sol` — Protocole Commit-Reveal (122 lignes)
+
+#### Machine d'états du dispute
+
+```mermaid
+stateDiagram-v2
+    [*] --> None
+    None --> Commit : raiseDispute()
+    Commit --> Reveal : commitDeadline passée
+    Reveal --> Resolved : resolveDispute()
+    
+    note right of Commit
+        Membres soumettent
+        hash(vote + salt)
+    end note
+    
+    note right of Reveal
+        Membres révèlent
+        vote + salt original
+    end note
+```
+
+#### Phase Commit
+```
+commitHash = keccak256(abi.encodePacked(vote, salt))
+```
+Le membre soumet **uniquement** le hash. Son vote reste invisible.
+
+#### Phase Reveal
+```
+expected = keccak256(abi.encodePacked(vote, salt))
+require(expected == commitments[reportId][member])
+```
+Le contrat vérifie la correspondance. Les non-révélations sont pénalisées (-2 réputation).
+
+#### Résolution
+
+| Condition | Résultat |
+|-----------|----------|
+| `acceptVotes >= thresholdK` | Accepté |
+| `rejectVotes >= thresholdK` | Rejeté |
+| Égalité / Votes insuffisants | Rejeté (anti-spam par défaut) |
+
+---
+
+### 3.7 `MockUSDC.sol` — Token de test (19 lignes)
+
+Token ERC20 minimaliste simulant l'USDC avec **6 décimales**. La fonction `mint` est restreinte au propriétaire.
+
+---
+
+## 4. Interface Utilisateur — Dashboards par Rôle
+
+### 4.1 Problème UX identifié
+
+L'interface actuelle mélange tous les rôles dans un seul dashboard, créant :
+- **Confusion cognitive** : un chercheur voit les actions du comité
+- **Risque de sécurité** : exposition d'actions sensibles (voting, escalation)
+- **Surcharge visuelle** : pas de personnalisation par persona
+
+### 4.2 Solution : Routing basé sur le wallet
+
+```mermaid
+flowchart TD
+    W[Connexion Wallet] --> D{Détection de rôle}
+    D -->|"isCommitteeMember[bountyId][addr]"| CD[Committee Dashboard]
+    D -->|"bounty.owner == addr"| OD[Owner Dashboard]
+    D -->|"Adresse standard"| RD[Researcher Dashboard]
+    D -->|"addr == treasury"| AD[Admin Dashboard]
+    
+    style CD fill:#2d6a4f,color:#fff
+    style OD fill:#1e3a5f,color:#fff
+    style RD fill:#4a235a,color:#fff
+    style AD fill:#7b1d1d,color:#fff
+```
+
+### 4.3 Researcher Dashboard
+
+![Mockup du Researcher Dashboard](C:\Users\hajar\.gemini\antigravity\brain\b03052b9-6614-4822-8668-754fa93dd708\researcher_dashboard_1775081928990.png)
+
+**Composants principaux :**
+
+| Zone | Contenu | Source de données |
+|------|---------|-------------------|
+| Stats Hero | Rapports actifs, rewards gagnés, score réputation, stakes verrouillés | `reports()`, `repScore()`, `getRequiredStake()` |
+| Timeline de soumissions | Liste chronologique avec statuts colorés | `reports(bountyId, reportId)` |
+| Jauge de réputation | Indicateur circulaire du score (-100 à +100) | `reputation.repScore(addr)` |
+| Formulaire de soumission | Chiffrement AES-256-GCM + upload IPFS + tx on-chain | `submitReport()` |
+| Alertes de slashing | Warnings visuels si stake à risque | Logique frontend |
+
+---
+
+### 4.4 Owner Dashboard
+
+![Mockup du Owner Dashboard](C:\Users\hajar\.gemini\antigravity\brain\b03052b9-6614-4822-8668-754fa93dd708\owner_dashboard_1775081947277.png)
+
+**Composants principaux :**
+
+| Zone | Contenu | Source de données |
+|------|---------|-------------------|
+| Mes Bounties | Liste cliquable avec token, reward, deadline | `getBountyCore()`, `getBountyState()` |
+| Panneau de rapports | Détails des soumissions par bounty | `reports(bountyId, reportId)` |
+| Indicateur Escrow | Barre de progression de la solvabilité | `escrowBalance` vs `rewardAmount` |
+| Création de bounty | Formulaire complet avec tous les paramètres | `createBounty()` |
+| Financement | Input montant + bouton de transfert | `fundBounty()` |
+
+---
+
+### 4.5 Committee Dashboard
+
+![Mockup du Committee Dashboard](C:\Users\hajar\.gemini\antigravity\brain\b03052b9-6614-4822-8668-754fa93dd708\committee_dashboard_1775081962974.png)
+
+**Composants principaux :**
+
+| Zone | Contenu | Source de données |
+|------|---------|-------------------|
+| File d'attente | Rapports en attente de review | `reports()` filtré par status |
+| Interface 3 onglets | Review directe / Commit / Reveal | `voteReport()`, `commitVote()`, `revealVote()` |
+| Progression du vote | Visualisation K-of-N (ex: 1/2 votes) | `acceptVotes`, `rejectVotes` |
+| Countdown SLA | Timer avec couleurs (vert/ambre/rouge) | `submittedAt + reviewSLA` |
+| Indicateur de phase | Position dans le cycle commit-reveal | `disputes[reportId].phase` |
+
+---
+
+### 4.6 Admin / Protocol Dashboard
+
+![Mockup de l'Admin Dashboard](C:\Users\hajar\.gemini\antigravity\brain\b03052b9-6614-4822-8668-754fa93dd708\admin_dashboard_1775081981891.png)
+
+**Composants principaux :**
+
+| Zone | Contenu | Source de données |
+|------|---------|-------------------|
+| Métriques globales | Total bounties, escrow, rapports, disputes | `bountyCount()`, lectures agrégées |
+| Santé du protocole | Solvabilité escrow, stakes verrouillés, treasury | `escrow.balances()`, `stakeManager.stakes()` |
+| Analytics disputes | Taux de résolution, disputes par semaine | Événements on-chain agrégés |
+| Distribution réputation | Histogramme des scores utilisateurs | `reputations()` agrégé |
+| Alertes système | SLA en breach, escrow low, anomalies | Calculs temps réel |
+
+---
+
+## 5. Structure des Composants React/Web3
+
+### 5.1 Arbre des composants
+
+```
+frontend/
+├── app/
+│   ├── layout.tsx          ← RootLayout (Providers + Theme + Navbar + Footer)
+│   ├── providers.tsx       ← WagmiProvider + QueryClient + Config
+│   ├── globals.css         ← Design system (glassmorphism, boutons, badges)
+│   ├── page.tsx            ← Dashboard principal (landing)
+│   ├── submit/page.tsx     ← Researcher: formulaire de soumission
+│   ├── committee/page.tsx  ← Committee: review + commit/reveal
+│   ├── dispute/page.tsx    ← Dispute management
+│   └── admin/
+│       ├── page.tsx        ← Admin dashboard + reports viewer
+│       └── create/page.tsx ← Formulaire de création de bounty
+├── components/
+│   ├── Navbar.tsx          ← Navigation responsive + wallet + theme toggle
+│   ├── Footer.tsx          ← Footer informatif
+│   ├── WalletConnect.tsx   ← Bouton de connexion MetaMask
+│   ├── ThemeProvider.tsx   ← Dark/Light mode provider
+│   ├── StatCard.tsx        ← Carte de statistique réutilisable
+│   ├── ActivityFeed.tsx    ← Feed d'activité temps réel
+│   └── AdminGuard.tsx      ← Guard d'accès admin (wallet-based)
+└── services/
+    ├── contracts.ts        ← ABI + adresse du contrat + helpers
+    ├── encryption.ts       ← AES-256-GCM (WebCrypto) + AAD
+    └── ipfs.ts             ← Upload/Fetch Pinata IPFS
+```
+
+### 5.2 Design System
+
+| Composant CSS | Description | Usage |
+|---------------|-------------|-------|
+| `.glass-card` | Carte glassmorphisme avec backdrop-blur | Conteneurs principaux |
+| `.glass-card-hover` | Glass + hover scale + border transition | Cartes cliquables |
+| `.gradient-text` | Texte gradient (brand → purple → pink) | Titres hero |
+| `.btn-primary` | Bouton gradient brand → purple + shadow | Actions principales |
+| `.btn-success` / `.btn-danger` | Boutons accept/reject | Voting |
+| `.btn-warning` | Bouton dégradé amber → orange | Actions de dispute |
+| `.input-field` | Input avec focus ring brand | Formulaires |
+| `.badge-*` | Badges de statut colorés | Indicateurs d'état |
+
+### 5.3 Service de chiffrement
+
+```mermaid
+sequenceDiagram
+    participant B as Browser
+    participant W as WebCrypto API
+    participant I as IPFS (Pinata)
+    participant S as Smart Contract
+
+    B->>W: generateKey() → AES-256-GCM
+    B->>W: encryptData(key, payload, AAD=[chainId:bountyId])
+    W-->>B: {ciphertext, iv}
+    B->>I: uploadToIPFS({ciphertext, iv})
+    I-->>B: CID
+    B->>B: hash(steps), hash(impact), hash(poc), hash(CID)
+    B->>S: submitReport(bountyId, salt, cidDigest, hSteps, hImpact, hPoc)
+    B-->>B: Afficher clé de déchiffrement (à sauvegarder!)
+```
+
+> [!WARNING]
+> L'AAD (Additional Authenticated Data) lie `chainId` et `bountyId` au chiffrement. Un payload chiffré pour la bounty #0 sur Arbitrum ne peut pas être rejoué sur une autre bounty ou une autre chaîne.
+
+---
+
+## 6. UX Flows — Parcours Utilisateur
+
+### 6.1 Flow complet : Soumission → Vote → Dispute → Finalisation
+
+```mermaid
+flowchart TD
+    START([Researcher]) --> ENCRYPT["1. Chiffrement AES-256-GCM\n(client-side)"]
+    ENCRYPT --> UPLOAD["2. Upload vers IPFS\n(payload chiffré)"]
+    UPLOAD --> SUBMIT["3. submitReport()\n+ verrouillage stake"]
+    SUBMIT --> QUEUE[File d'attente comité]
+    
+    QUEUE --> VOTE{"4. Vote Phase 1\n(K-of-N)"}
+    VOTE -->|"≥ K accept"| ACCEPTED[Accepté]
+    VOTE -->|"≥ K reject"| REJECTED[Rejeté]
+    VOTE -->|"SLA expiré"| ESCALATE["5. triggerEscalation()"]
+    
+    REJECTED --> DISPUTE{"6. raiseDispute()\n(+ appeal bond)"}
+    ESCALATE --> CR
+    DISPUTE --> CR["7. Commit-Reveal"]
+    
+    subgraph "Commit-Reveal (2 phases)"
+        CR --> COMMIT["Phase Commit\nhash(vote + salt)"]
+        COMMIT -->|deadline| REVEAL["Phase Reveal\nvote + salt"]
+    end
+    
+    REVEAL --> RESOLVE["8. resolveDispute()"]
+    RESOLVE -->|"accept ≥ K"| ACCEPTED
+    RESOLVE -->|"reject ≥ K"| REJECTED2[Rejeté définitif]
+    
+    ACCEPTED --> FINALIZE["9. finalizeReport()"]
+    REJECTED2 --> FINALIZE
+    
+    FINALIZE -->|Accepté| PAY["Reward → Researcher\nStake → Refunded"]
+    FINALIZE -->|Rejeté| SLASH["Stake → Treasury\nSlashed"]
+    
+    style ACCEPTED fill:#2d6a4f,color:#fff
+    style REJECTED fill:#7b1d1d,color:#fff
+    style REJECTED2 fill:#7b1d1d,color:#fff
+    style PAY fill:#2d6a4f,color:#fff
+    style SLASH fill:#7b1d1d,color:#fff
+```
+
+### 6.2 Matrice rôles et permissions
+
+| Action | Researcher | Owner | Committee | Admin | Public |
+|--------|:----------:|:-----:|:---------:|:-----:|:------:|
+| `createBounty` | — | — | — | — | **Tous** |
+| `fundBounty` | — | **Oui** | — | — | — |
+| `submitReport` | **Oui** | — | — | — | — |
+| `voteReport` | — | — | **Oui** | — | — |
+| `raiseDispute` | **Oui** (auteur) | — | — | — | — |
+| `triggerEscalation` | — | — | — | — | **Tous** |
+| `commitVote` | — | — | **Oui** | — | — |
+| `revealVote` | — | — | **Oui** | — | — |
+| `resolveDispute` | — | — | — | — | **Tous** |
+| `finalizeReport` | — | — | — | — | **Tous** |
+| Lecture données | **Oui** | **Oui** | **Oui** | **Oui** | **Oui** |
+
+---
+
+## 7. Tests et Validation
+
+### 7.1 Framework de test
+
+Les tests sont écrits avec **Foundry** (`forge-std/Test.sol`), offrant :
+- Cheat codes (`vm.prank`, `vm.warp`, `vm.expectRevert`)
+- Support natif du fuzz testing
+- Support des invariant tests
+- Exécution en EVM locale ultra-rapide
+
+### 7.2 Configuration du test (`setUp`)
+
+```solidity
+address owner       = address(1);
+address researcher1 = address(2);
+address researcher2 = address(3);
+address committee1  = address(4);
+address committee2  = address(5);
+address committee3  = address(6);
+
+// Bounty avec : reward=5000, stake=50, bond=100,
+// deadline=+7j, SLA=3j, rateLimit=48h, K=2/3
+```
+
+| Paramètre | Valeur |
+|-----------|--------|
+| Token | MockUSDC (6 dec) |
+| Récompense | 5 000 USDC |
+| Stake | 50 USDC |
+| Appeal Bond | 100 USDC |
+| Deadline | +7 jours |
+| Review SLA | 3 jours |
+| Rate Limit Window | 48 heures |
+| Max dans la fenêtre | 2 |
+| Max actifs | 1 |
+| Comité | 3 membres |
+| Seuil K | 2 (2-of-3) |
+
+### 7.3 Tests unitaires détaillés
+
+#### `test_SubmitReportNormal`
+**Objectif** : Vérifier le flux nominal de soumission d'un rapport.
+
+| Étape | Action | Vérification |
+|-------|--------|--------------|
+| 1 | Owner approuve et fund 5000 USDC | Escrow reçoit les fonds |
+| 2 | Researcher1 approuve 50 USDC (stake) | — |
+| 3 | `submitReport()` avec hashes valides | `reportId` retourné |
+| 4 | Lecture du statut du rapport | `status == Submitted` |
+
+**Résultat attendu** : Le rapport est créé avec le statut `Submitted`.
+
+---
+
+#### `test_EscrowSolvencyRevert`
+**Objectif** : Vérifier que la soumission échoue si l'escrow n'est pas suffisamment financé.
+
+| Étape | Action | Vérification |
+|-------|--------|--------------|
+| 1 | Bounty créée mais **pas financée** | `escrowBalance == 0` |
+| 2 | Researcher tente de soumettre | `vm.expectRevert(InsufficientEscrow)` |
+
+**Résultat attendu** : Revert avec `InsufficientEscrow`. Protection contre l'insolvabilité.
+
+---
+
+#### `test_AppealBond`
+**Objectif** : Vérifier que l'appeal bond est correctement requis pour ouvrir un dispute.
+
+| Étape | Action | Vérification |
+|-------|--------|--------------|
+| 1 | Soumission + 2 votes reject | Statut → `Rejected` |
+| 2 | `raiseDispute()` avec 50 USDC (insuffisant) | Revert |
+| 3 | `raiseDispute()` avec 100 USDC (exact) | Succès |
+| 4 | Lecture du statut | `status == Disputed` |
+
+**Résultat attendu** : Le dispute ne s'ouvre que si le bond exact est payé.
+
+---
+
+#### `test_TriggerEscalation`
+**Objectif** : Vérifier l'escalade automatique lorsque le SLA expire.
+
+| Étape | Action | Vérification |
+|-------|--------|--------------|
+| 1 | Soumission d'un rapport | — |
+| 2 | `triggerEscalation()` immédiatement | Revert `SLANotExpired` |
+| 3 | `vm.warp(+4 jours)` (SLA = 3j) | — |
+| 4 | `triggerEscalation()` | Succès |
+| 5 | Lecture du statut | `status == Disputed` |
+
+**Résultat attendu** : L'escalade n'est possible qu'après expiration du SLA.
+
+---
+
+#### `test_MaxActiveSubmissions`
+**Objectif** : Vérifier la limite de rapports actifs simultanés.
+
+| Étape | Action | Vérification |
+|-------|--------|--------------|
+| 1 | Researcher soumet le rapport #1 | Succès |
+| 2 | Researcher tente le rapport #2 (maxActive=1) | Revert `RateLimitExceeded` |
+
+**Résultat attendu** : Un chercheur ne peut pas dépasser `maxActiveSubmissions`.
+
+---
+
+#### `test_FullCommitRevealFlow`
+**Objectif** : Vérifier le cycle complet : soumission → rejet → dispute → commit → reveal → résolution → finalisation.
+
+| Étape | Action | Vérification |
+|-------|--------|--------------|
+| 1 | Submit | `Submitted` |
+| 2 | 2 votes reject | `Rejected` |
+| 3 | `raiseDispute()` + bond | `Disputed` |
+| 4 | 2 commits avec hashes | Commits enregistrés |
+| 5 | `vm.warp(+4j)` → Phase Reveal | — |
+| 6 | 2 reveals (accept) | Votes comptés |
+| 7 | `vm.warp(+4j)` → `resolveDispute()` | — |
+| 8 | Lecture du statut | `status == Finalized` |
+
+**Résultat attendu** : Le cycle complet fonctionne de bout en bout.
+
+---
+
+### 7.4 Simulations d'attaques
+
+#### `test_FrontRunningSimulation`
+**Attaque simulée** : Un attaquant observe la transaction d'un chercheur dans le mempool et tente de copier exactement les mêmes arguments pour voler la soumission.
+
+**Protection** : Le `commitHash` inclut `msg.sender` dans le calcul :
+```solidity
+commitHash = keccak256(abi.encodePacked(bountyId, msg.sender, cidDigest, salt, ...))
+```
+
+| Vérification | Résultat |
+|-------------|----------|
+| Hash du chercheur légitime | `keccak256(...researcher1...)` |
+| Hash de l'attaqueur (mêmes args) | `keccak256(...attacker...)` |
+| Les deux hashes sont **différents** | `assertTrue(attackerHash != expectedHash)` |
+
+**Conclusion** : La domain separation par `msg.sender` rend le front-running inefficace.
+
+---
+
+#### `test_SpamDisputeAttackBlocked`
+**Attaque simulée** : Un acteur malveillant tente de spammer le système avec des disputes sans fin pour bloquer le protocole.
+
+**Protection** : Chaque dispute coûte un `appealBond` de 100 USDC.
+
+| Vérification | Résultat |
+|-------------|----------|
+| Balance avant dispute | `preBalance` |
+| Balance après dispute | `preBalance - 100 USDC` |
+| Coût pour le spammeur | **100 USDC par dispute** |
+
+**Conclusion** : Le coût financier rend le spam économiquement non viable.
+
+---
+
+### 7.5 Fuzz Testing
+
+#### `testFuzz_VotingThresholdAndAcceptance(uint8 N, uint8 K)`
+**Objectif** : Prouver que le mécanisme de seuil K-of-N fonctionne pour **toute** combinaison valide de N et K.
+
+| Paramètre | Plage | Description |
+|-----------|-------|-------------|
+| `N` | [1, 10] | Taille du comité |
+| `K` | [1, N] | Seuil requis |
+
+**Invariant vérifié** :
+- Avec K-1 votes : statut reste `Submitted`
+- Avec K votes : statut passe à `Accepted`
+
+Foundry exécute ce test avec **256 combinaisons aléatoires** par défaut.
+
+---
+
+#### `testFuzz_StakeMultiplier(int64 score)`
+**Objectif** : Prouver que le multiplicateur de stake est toujours borné.
+
+| Paramètre | Plage | Description |
+|-----------|-------|-------------|
+| `score` | [-1000, +1000] | Score de réputation |
+
+**Invariants vérifiés** :
+- `stake ≥ 25 USDC` (0.5× minimum)
+- `stake ≤ 250 USDC` (5.0× maximum)
+
+---
+
+### 7.6 Invariant Tests
+
+#### `invariant_EscrowSolvency`
+**Invariant** : À tout moment, le solde de tokens du contrat `Escrow` doit être **exactement égal** à la somme des `escrowBalance` enregistrés.
+
+```solidity
+assertEq(token.balanceOf(address(escrow)), escrowBalance);
+```
+
+Cet invariant est vérifié après **chaque séquence aléatoire** d'appels de fonctions générée par Foundry.
+
+#### `invariant_StakeSolvency`
+**Invariant** : Le contrat `StakeManager` doit toujours détenir les tokens correspondant aux stakes actifs.
+
+---
+
+### 7.7 Tableau récapitulatif des tests
+
+| Test | Type | Catégorie | Statut attendu |
+|------|------|-----------|----------------|
+| `test_SubmitReportNormal` | Unit | Flux nominal | PASS |
+| `test_EscrowSolvencyRevert` | Unit | Solvabilité | PASS |
+| `test_AppealBond` | Unit | Mécanisme de bond | PASS |
+| `test_TriggerEscalation` | Unit | Automatisation SLA | PASS |
+| `test_MaxActiveSubmissions` | Unit | Rate limiting | PASS |
+| `test_FullCommitRevealFlow` | Unit | Cycle complet E2E | PASS |
+| `test_FrontRunningSimulation` | Attack | Front-running | PASS |
+| `test_SpamDisputeAttackBlocked` | Attack | Spam dispute | PASS |
+| `testFuzz_VotingThresholdAndAcceptance` | Fuzz | Consensus K-of-N | PASS (256 runs) |
+| `testFuzz_StakeMultiplier` | Fuzz | Bornes mathématiques | PASS (256 runs) |
+| `invariant_EscrowSolvency` | Invariant | Solvabilité escrow | PASS |
+| `invariant_StakeSolvency` | Invariant | Solvabilité stakes | PASS |
+
+---
+
+## 8. Analyse de Sécurité
+
+### 8.1 Patterns de sécurité implémentés
+
+| Pattern | Localisation | Protection contre |
+|---------|-------------|-------------------|
+| **CEI (Checks-Effects-Interactions)** | `_finalize()`, `resolveDispute()` | Reentrancy |
+| **ReentrancyGuard** | Toutes les fonctions mutatives | Reentrancy cross-function |
+| **SafeERC20** | Tous les transferts de tokens | Tokens non-standard (USDT) |
+| **Custom Errors** | Partout | Optimisation gas |
+| **onlyPlatform** | Tous les modules | Accès non autorisé |
+| **Domain Separation** | `submitReport()` | Front-running, replay |
+| **Ring Buffer O(1)** | `submitReport()` | Gas griefing |
+| **Solvency Check** | `submitReport()`, `_finalize()` | Double spend, insolvabilité |
+| **Appeal Bond** | `raiseDispute()` | Spam de disputes |
+| **Stake dynamique** | `getRequiredStake()` | Sybil attacks |
+| **Commit-Reveal** | `DisputeModule` | Groupthink, vote withholding |
+| **Half-life décroisssante** | `Reputation` | Manipulation de réputation long-terme |
+
+### 8.2 Flux de fonds sécurisé
+
+```mermaid
+flowchart LR
+    subgraph "Entrées"
+        OW[Owner] -->|"fundBounty()"| ESC[Escrow]
+        RE[Researcher] -->|"stake lock"| SM[StakeManager]
+        RE -->|"appeal bond"| ESC
+    end
+    
+    subgraph "Sorties Acceptation"
+        ESC -->|"rewardAmount"| RE2[Researcher]
+        SM -->|"refundStake()"| RE2
+        ESC -->|"appeal bond refund"| RE2
+    end
+    
+    subgraph "Sorties Rejet"
+        SM -->|"slashStake()"| TR[Treasury]
+        ESC -->|"appeal bond confisqué"| TR
+    end
+
+    style ESC fill:#2d6a4f,color:#fff
+    style SM fill:#6b3d14,color:#fff
+    style TR fill:#7b1d1d,color:#fff
+```
+
+### 8.3 Vecteurs d'attaque analysés
+
+| Vecteur | Mécanisme de défense | Testé |
+|---------|---------------------|-------|
+| **Front-running** | Domain separation (`msg.sender` dans le hash) | `test_FrontRunningSimulation` |
+| **Spam de disputes** | Appeal bond de 100 USDC | `test_SpamDisputeAttackBlocked` |
+| **Spam de soumissions** | Ring buffer + `maxActiveSubmissions` | `test_MaxActiveSubmissions` |
+| **Gas griefing (boucles)** | Ring buffer O(1) au lieu de tableau dynamique | Architecture |
+| **Reentrancy** | `nonReentrant` + CEI | Pattern systématique |
+| **Token non-standard** | `SafeERC20` | OpenZeppelin audité |
+| **Insolvabilité escrow** | Vérification `escrowBalance >= rewardAmount` | `test_EscrowSolvencyRevert` |
+| **Groupthink voting** | Commit-Reveal 2 phases | `test_FullCommitRevealFlow` |
+| **Vote withholding** | Pénalité réputation pour non-reveal | `resolveDispute()` |
+| **Sybil attack** | Stake dynamique basé sur réputation | `testFuzz_StakeMultiplier` |
+| **Replay attack (cross-chain)** | AAD dans le chiffrement (`chainId:bountyId`) | `encryption.ts` |
+| **Double paiement** | Flag `r.paid = true` avant transfert | `_finalize()` |
+
+---
+
+## 9. Améliorations Proposées
+
+### 9.1 Améliorations Smart Contract
+
+| Priorité | Amélioration | Description |
+|----------|-------------|-------------|
+| Haute | **Timelock admin** | Ajouter un `TimelockController` pour les opérations sensibles |
+| Haute | **Pause d'urgence** | Implémenter `Pausable` (OpenZeppelin) pour arrêter le protocole |
+| Moyenne | **Multi-token escrow** | Supporter plusieurs tokens par bounty |
+| Moyenne | **Severity tiers** | Rewards par sévérité (Critical/High/Medium/Low) |
+| Basse | **Upgradability** | Proxy pattern (UUPS) pour les mises à jour |
+| Basse | **Governance DAO** | Vote on-chain pour les paramètres du protocole |
+
+### 9.2 Améliorations UX/Frontend
+
+| Priorité | Amélioration | Description |
+|----------|-------------|-------------|
+| Haute | **Routing wallet-based** | Détection automatique du rôle à la connexion |
+| Haute | **Notifications temps réel** | WebSocket ou polling pour les événements on-chain |
+| Moyenne | **Timeline interactive** | Visualisation du cycle de vie avec hover details |
+| Moyenne | **Export de données** | Export CSV/PDF des rapports pour audit |
+| Basse | **Mobile responsive** | Optimisation complète pour mobile |
+| Basse | **Multi-langue** | Support FR/EN/AR |
+
+### 9.3 Améliorations Sécurité
+
+| Priorité | Amélioration | Description |
+|----------|-------------|-------------|
+| Haute | **Audit externe** | Audit par une firme spécialisée (Trail of Bits, OpenZeppelin) |
+| Haute | **Bug bounty récursif** | Bug bounty sur la plateforme elle-même |
+| Moyenne | **Rate limiting global** | Limite par adresse par époque (pas seulement par bounty) |
+| Basse | **Insurance pool** | Pool d'assurance pour couvrir les exploits |
+
+---
+
+## 10. Conclusion
+
+BugBountyDeFi représente une solution décentralisée complète pour la gestion de programmes de bug bounty, éliminant la dépendance envers un tiers de confiance grâce à :
+
+1. **Un escrow on-chain** garantissant la solvabilité et le paiement automatique
+2. **Un protocole commit-reveal** assurant l'équité et l'indépendance des votes
+3. **Un système de réputation temporelle** modulant dynamiquement l'accès au protocole
+4. **Une architecture modulaire** (Hub & Modules) facilitant l'audit et la maintenance
+5. **Un chiffrement client-side** (AES-256-GCM avec AAD) protégeant la confidentialité des rapports
+6. **Une suite de tests exhaustive** couvrant les flux nominaux, les cas limites, le fuzz testing et les simulations d'attaques
+
+Le projet est structuré pour être présenté comme un produit blockchain de niveau startup, avec une interface SaaS moderne séparée par rôles et une analyse de sécurité rigoureuse.
